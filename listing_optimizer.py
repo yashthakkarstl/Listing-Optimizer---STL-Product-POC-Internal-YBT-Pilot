@@ -49,21 +49,21 @@ def load_listings():
 
 
 def extract_sentiment(client: Groq, review_text: str) -> tuple[str, str]:
-    """Returns (positive_bullets, negative_sentiment). Positive as bullet points, negative as paragraphs."""
-    prompt = """Analyze this guest review and output two sections.
+    """Returns (positive_bullets, negative_bullets). Both as bullet points from the raw review."""
+    prompt = """Analyze this guest review and output two sections. Extract directly from the raw review text; list as short bullet points, one per line, each line starting with "- ".
 
-First section: POSITIVE — only what guests liked or praised. List as short bullet points, one per line, each line starting with "- ". If none, write "- No clear positive highlights found."
+First section: POSITIVE — only what guests liked or praised. If none, write "- No clear positive highlights found."
 
-Second section: NEGATIVE — what guests complained about or found lacking (for maintenance/work orders). Use 2–3 short paragraphs. If none, write "No clear negative feedback found."
+Second section: NEGATIVE — what guests complained about or found lacking (for work orders, maintenance, owner scoring). If none, write "- No clear negative feedback found."
 
 Format your reply exactly like this (include the labels on their own lines):
 POSITIVE:
 - point one
 - point two
-- point three
 
 NEGATIVE:
-(paragraphs here)
+- point one
+- point two
 
 Review:
 """
@@ -192,7 +192,7 @@ def main():
         with tab_neg:
             st.subheader("Negative sentiment")
             st.caption("Use this feedback to analyze work orders, maintenance, and owner scoring.")
-            st.write(negative_text)
+            st.markdown(negative_text)
             st.divider()
             st.subheader("Log for work orders, maintenance & owner scoring")
             with st.form("work_log_form"):
