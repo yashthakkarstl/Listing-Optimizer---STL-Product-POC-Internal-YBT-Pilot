@@ -116,6 +116,8 @@ def relative_time(iso_ts: str) -> str:
         if delta.days < 7:
             return f"{delta.days} days ago"
         return at.strftime("%b %d, %Y %I:%M %p")
+    except Exception:
+        return iso_ts[:19] if len(iso_ts) > 19 else iso_ts
 
 
 @st.cache_data
