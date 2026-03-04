@@ -2,7 +2,7 @@
 Listing Optimizer - Proof of Concept
 Uses Listings.csv only. Analyzes guest reviews for positive and negative sentiment.
 - Positive: used for content (generate updated listing title).
-- Negative: shown to clients for work orders, maintenance, and owner scoring (raise ticket).
+- Negative: shown to clients to analyze work orders, maintenance, and owner scoring.
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ LLAMA_MODEL = _get_secret("LLAMA_MODEL", os.getenv("LLAMA_MODEL", "llama-3.3-70b
 
 # Session state keys
 SENTIMENT_CACHE = "sentiment_cache"  # dict of listing_id -> {"positive": str, "negative": str}
-TICKETS = "tickets"  # list of {"listing_id", "listing_name", "category", "description"}
+WORK_LOGS = "work_logs"  # list of {"listing_id", "listing_name", "category", "description"} for work orders, maintenance, owner scoring
 
 
 @st.cache_data
@@ -132,8 +132,8 @@ def main():
 
     if SENTIMENT_CACHE not in st.session_state:
         st.session_state[SENTIMENT_CACHE] = {}
-    if TICKETS not in st.session_state:
-        st.session_state[TICKETS] = []
+    if WORK_LOGS not in st.session_state:
+        st.session_state[WORK_LOGS] = []
 
     df = load_listings()
     if df.empty:
@@ -190,35 +190,35 @@ def main():
                     st.write(description)
 
         with tab_neg:
-            st.subheader("Negative sentiment (for work orders & maintenance)")
+            st.subheader("Negative sentiment")
+            st.caption("Use this feedback to analyze work orders, maintenance, and owner scoring.")
             st.write(negative_text)
             st.divider()
-            st.subheader("Raise ticket")
-            with st.form("raise_ticket_form"):
+            st.subheader("Log for work orders, maintenance & owner scoring")
+            with st.form("work_log_form"):
                 category = st.selectbox(
-                    "Category",
-                    ["Maintenance", "Repair", "Cleaning", "Amenity issue", "Other"],
-                    key="ticket_category",
+                    "Use for",
+                    ["Work order", "Maintenance", "Owner scoring", "Other"],
+                    key="work_log_category",
                 )
-                description = st.text_area("Description (optional)", key="ticket_desc", height=80)
-                submitted = st.form_submit_button("Submit ticket")
+                description = st.text_area("Notes (optional)", key="work_log_desc", height=80)
+                submitted = st.form_submit_button("Log for analysis")
             if submitted:
-                st.session_state[TICKETS].append({
+                st.session_state[WORK_LOGS].append({
                     "listing_id": listing_id,
                     "listing_name": listing_name,
                     "category": category,
-                    "description": description or "(No description)",
+                    "description": description or "(No notes)",
                 })
-                st.success("Ticket raised. It will be used for work orders and owner scoring.")
+                st.success("Logged. Clients can use this for work orders, maintenance, and owner scoring.")
                 st.balloons()
 
-        # Optional: show raised tickets for this session
-        session_tickets = [t for t in st.session_state[TICKETS] if t["listing_id"] == listing_id]
-        if session_tickets:
+        session_logs = [w for w in st.session_state[WORK_LOGS] if w["listing_id"] == listing_id]
+        if session_logs:
             st.divider()
-            with st.expander("Tickets raised for this property (this session)"):
-                for t in session_tickets:
-                    st.write(f"**{t['category']}** — {t['description']}")
+            with st.expander("Logged for this property (work orders / maintenance / owner scoring)"):
+                for w in session_logs:
+                    st.write(f"**{w['category']}** — {w['description']}")
 
     st.divider()
     st.caption("Data: " + LISTINGS_CSV + " · Model: " + LLAMA_MODEL)
