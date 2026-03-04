@@ -49,16 +49,18 @@ def load_listings():
 
 
 def extract_sentiment(client: Groq, review_text: str) -> tuple[str, str]:
-    """Returns (positive_sentiment, negative_sentiment) as short paragraphs."""
-    prompt = """Analyze this guest review and output two sections. Use 2–3 short, flowing paragraphs per section (no bullet points).
+    """Returns (positive_bullets, negative_sentiment). Positive as bullet points, negative as paragraphs."""
+    prompt = """Analyze this guest review and output two sections.
 
-First section: POSITIVE — only what guests liked or praised. Use a listing-style tone. If none, write "No clear positive highlights found."
+First section: POSITIVE — only what guests liked or praised. List as short bullet points, one per line, each line starting with "- ". If none, write "- No clear positive highlights found."
 
-Second section: NEGATIVE — only what guests complained about or found lacking (for maintenance/work orders). If none, write "No clear negative feedback found."
+Second section: NEGATIVE — what guests complained about or found lacking (for maintenance/work orders). Use 2–3 short paragraphs. If none, write "No clear negative feedback found."
 
 Format your reply exactly like this (include the labels on their own lines):
 POSITIVE:
-(paragraphs here)
+- point one
+- point two
+- point three
 
 NEGATIVE:
 (paragraphs here)
@@ -85,13 +87,22 @@ Review:
         return f"Error: {e}", ""
 
 
-def generate_listing_title(client: Groq, positive_sentiment: str, property_type: str, city: str) -> str:
-    prompt = f"""Using ONLY these positive guest highlights, write one amazing Airbnb listing title. Include property type and location if helpful.
-- Maximum 200 characters.
-- Output ONLY the title, no quotes, no explanation.
+def generate_listing_content(client: Groq, positive_bullets: str, property_type: str, city: str) -> tuple[str, str]:
+    """Returns (title, description_paragraphs) for the listing. Description is 2–3 short paragraphs."""
+    prompt = f"""Using ONLY these positive guest highlights from reviews, create an Airbnb listing.
 
-Positive highlights:
-{positive_sentiment}
+1) First line: a catchy listing TITLE, maximum 200 characters. Include property type and location if helpful.
+2) Then write 2–3 short, flowing PARAGRAPHS for the listing description (what guests will read). Use a warm, inviting tone. Base the content only on the positive highlights below.
+
+Format your reply exactly like this (include the labels on their own lines):
+TITLE:
+(one line, max 200 chars)
+
+DESCRIPTION:
+(2–3 paragraphs here)
+
+Positive highlights from reviews:
+{positive_bullets}
 
 Property type: {property_type}. City: {city}.
 """
@@ -99,12 +110,19 @@ Property type: {property_type}. City: {city}.
         r = client.chat.completions.create(
             model=LLAMA_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=150,
+            max_tokens=600,
         )
-        title = (r.choices[0].message.content or "").strip().strip('"')
-        return title[:200]
+        text = (r.choices[0].message.content or "").strip()
+        title, description = "", ""
+        if "DESCRIPTION:" in text:
+            parts = text.split("DESCRIPTION:", 1)
+            title = parts[0].replace("TITLE:", "").strip().strip('"')[:200]
+            description = parts[1].strip()
+        else:
+            title = text.replace("TITLE:", "").strip().strip('"')[:200]
+        return title, description
     except Exception as e:
-        return f"Error generating title: {e}"
+        return f"Error: {e}", ""
 
 
 def main():
@@ -151,23 +169,25 @@ def main():
         tab_pos, tab_neg = st.tabs(["Positive sentiment", "Negative sentiment"])
 
         with tab_pos:
-            st.subheader("Positive sentiment (for listing content)")
-            st.write(positive_text)
+            st.subheader("Positive sentiment (from reviews)")
+            st.markdown(positive_text)
             st.divider()
             if st.button("Generate updated listing", type="primary", key="gen_listing"):
                 if not LLAMA_API_KEY:
                     st.error("LLAMA_API_KEY is not set.")
                 else:
-                    with st.spinner("Generating 200-character listing title…"):
+                    with st.spinner("Generating listing (title + paragraphs)…"):
                         client = Groq(api_key=LLAMA_API_KEY)
-                        title = generate_listing_title(
+                        title, description = generate_listing_content(
                             client, positive_text,
                             str(row.get("property_type", "")),
                             str(row.get("city", "")),
                         )
-                    st.success("Generated listing title (≤200 chars)")
-                    st.info(title)
+                    st.subheader("Generated listing")
+                    st.write("**Title** (≤200 chars): ", title)
                     st.caption(f"Length: {len(title)} characters")
+                    st.write("**Description** (paragraphs):")
+                    st.write(description)
 
         with tab_neg:
             st.subheader("Negative sentiment (for work orders & maintenance)")
