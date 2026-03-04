@@ -1,8 +1,11 @@
 """
 Listing Optimizer - Proof of Concept
-Uses Listings.csv only. Extracts positive sentiment from the Review column
-and generates a 200-character listing title via LLM (Llama).
+Uses Listings.csv only. Analyzes guest reviews for positive and negative sentiment.
+- Positive: used for content (generate updated listing title).
+- Negative: shown to clients for work orders, maintenance, and owner scoring (raise ticket).
 """
+from __future__ import annotations
+
 import os
 import streamlit as st
 from dotenv import load_dotenv
@@ -10,15 +13,27 @@ load_dotenv()
 import pandas as pd
 from groq import Groq
 
-# --- Config (set your key before running) ---
+# --- Config: from TOML secrets (Streamlit Cloud) or .env ---
 LISTINGS_CSV = "Listings_1.csv"
-LLAMA_API_KEY = os.getenv("LLAMA_API_KEY", "")
-LLAMA_MODEL = os.getenv("LLAMA_MODEL", "llama-3.3-70b-versatile")
+
+
+def _get_secret(key: str, default: str = "") -> str:
+    try:
+        return st.secrets.get(key, default) or default
+    except Exception:
+        return os.getenv(key, default)
+
+
+LLAMA_API_KEY = _get_secret("LLAMA_API_KEY", os.getenv("LLAMA_API_KEY", ""))
+LLAMA_MODEL = _get_secret("LLAMA_MODEL", os.getenv("LLAMA_MODEL", "llama-3.3-70b-versatile"))
+
+# Session state keys
+SENTIMENT_CACHE = "sentiment_cache"  # dict of listing_id -> {"positive": str, "negative": str}
+TICKETS = "tickets"  # list of {"listing_id", "listing_name", "category", "description"}
 
 
 @st.cache_data
 def load_listings():
-    # CSV may be Windows-encoded (cp1252); try UTF-8 first, then fallback
     for encoding in ("utf-8", "cp1252", "latin-1"):
         try:
             df = pd.read_csv(LISTINGS_CSV, encoding=encoding)
@@ -27,29 +42,47 @@ def load_listings():
             continue
     else:
         df = pd.read_csv(LISTINGS_CSV, encoding="utf-8", encoding_errors="replace")
-    # Ensure Review column exists (last column)
     if "Review" not in df.columns:
-        last_col = df.columns[-1]
-        df = df.rename(columns={last_col: "Review"})
-    # Drop rows with no review text
+        df = df.rename(columns={df.columns[-1]: "Review"})
     df = df[df["Review"].notna() & (df["Review"].astype(str).str.strip() != "")].copy()
     return df
 
 
-def extract_positive_sentiment(client: Groq, review_text: str) -> str:
-    prompt = """From this guest review, extract ONLY the positive things guests said. Write them as 2–3 short, flowing paragraphs (no bullet points). Use a listing-style tone, like descriptive copy for a property. If there are no clear positives, say "No clear positive highlights found."
+def extract_sentiment(client: Groq, review_text: str) -> tuple[str, str]:
+    """Returns (positive_sentiment, negative_sentiment) as short paragraphs."""
+    prompt = """Analyze this guest review and output two sections. Use 2–3 short, flowing paragraphs per section (no bullet points).
+
+First section: POSITIVE — only what guests liked or praised. Use a listing-style tone. If none, write "No clear positive highlights found."
+
+Second section: NEGATIVE — only what guests complained about or found lacking (for maintenance/work orders). If none, write "No clear negative feedback found."
+
+Format your reply exactly like this (include the labels on their own lines):
+POSITIVE:
+(paragraphs here)
+
+NEGATIVE:
+(paragraphs here)
+
 Review:
 """
-    prompt += review_text[:4000]  # cap length
+    prompt += review_text[:4000]
     try:
         r = client.chat.completions.create(
             model=LLAMA_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=400,
+            max_tokens=600,
         )
-        return (r.choices[0].message.content or "").strip()
+        text = (r.choices[0].message.content or "").strip()
+        positive, negative = "", ""
+        if "NEGATIVE:" in text:
+            parts = text.split("NEGATIVE:", 1)
+            positive = parts[0].replace("POSITIVE:", "").strip()
+            negative = parts[1].strip()
+        else:
+            positive = text.replace("POSITIVE:", "").strip()
+        return positive, negative
     except Exception as e:
-        return f"Error extracting sentiment: {e}"
+        return f"Error: {e}", ""
 
 
 def generate_listing_title(client: Groq, positive_sentiment: str, property_type: str, city: str) -> str:
@@ -75,57 +108,100 @@ Property type: {property_type}. City: {city}.
 
 
 def main():
-    st.set_page_config(page_title="Listing Optimizer - STL Product POC", page_icon="🏠", layout="wide")
-    st.title("🏠 Listing Optimizer - STL Product POC")
-    st.caption("Use guest reviews to generate a compelling listing title (Listings.csv only)")
+    st.set_page_config(page_title="Listing Optimizer", page_icon="🏠", layout="wide")
+    st.title("🏠 Listing Optimizer")
+    st.caption("Analyze review sentiment · Use positive for listing content · Use negative for work orders & tickets")
+
+    if SENTIMENT_CACHE not in st.session_state:
+        st.session_state[SENTIMENT_CACHE] = {}
+    if TICKETS not in st.session_state:
+        st.session_state[TICKETS] = []
 
     df = load_listings()
     if df.empty:
-        st.error("No listings with reviews found in Listings.csv.")
+        st.error("No listings with reviews found.")
         return
 
-    # Listing selector
     df["_label"] = df["name"].fillna("") + " (ID: " + df["listing_id"].astype(str) + ")"
     options = df["_label"].tolist()
-    choice = st.selectbox("Select a listing", options, index=0)
+    choice = st.selectbox("Select property", options, index=0, key="property_select")
     idx = df[df["_label"] == choice].index[0]
     row = df.loc[idx]
+    listing_id = str(row.get("listing_id", ""))
+    listing_name = str(row.get("name", ""))
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Current listing")
-        st.write("**Title:**", row.get("name", "—"))
-        st.write("**Property type:**", row.get("property_type", "—"))
-        st.write("**City:**", row.get("city", "—"))
-    with col2:
-        st.subheader("Guest review (source)")
-        review = str(row.get("Review", ""))[:2000]
-        st.text_area("Review text", value=review, height=120, disabled=True)
+    # Run sentiment analysis
+    review_text = str(row.get("Review", ""))
+    cached = st.session_state[SENTIMENT_CACHE].get(listing_id)
 
-    st.divider()
-    if not LLAMA_API_KEY:
-        st.warning("Set **LLAMA_API_KEY** in your environment (or in a `.env` file) before generating.")
-    if st.button("Generate listing title", type="primary", use_container_width=True):
+    if not cached:
         if not LLAMA_API_KEY:
-            st.error("LLAMA_API_KEY is not set. Add your key and restart.")
-            return
-        with st.spinner("Extracting positive sentiment…"):
-            client = Groq(api_key=LLAMA_API_KEY)
-            positive = extract_positive_sentiment(client, str(row.get("Review", "")))
-        st.subheader("Positive sentiment from reviews")
-        st.write(positive)
-        with st.spinner("Generating 200-character listing title…"):
-            title = generate_listing_title(
-                client, positive,
-                str(row.get("property_type", "")),
-                str(row.get("city", "")),
-            )
-        st.subheader("Generated listing title (≤200 chars)")
-        st.success(title)
-        st.caption(f"Length: {len(title)} characters")
+            st.warning("Set **LLAMA_API_KEY** in secrets or .env to run sentiment analysis.")
+        else:
+            if st.button("Run sentiment analysis", type="primary", use_container_width=True):
+                with st.spinner("Analyzing positive and negative sentiment…"):
+                    client = Groq(api_key=LLAMA_API_KEY)
+                    pos, neg = extract_sentiment(client, review_text)
+                    st.session_state[SENTIMENT_CACHE][listing_id] = {"positive": pos, "negative": neg}
+                st.rerun()
+    else:
+        positive_text = cached["positive"]
+        negative_text = cached["negative"]
+
+        tab_pos, tab_neg = st.tabs(["Positive sentiment", "Negative sentiment"])
+
+        with tab_pos:
+            st.subheader("Positive sentiment (for listing content)")
+            st.write(positive_text)
+            st.divider()
+            if st.button("Generate updated listing", type="primary", key="gen_listing"):
+                if not LLAMA_API_KEY:
+                    st.error("LLAMA_API_KEY is not set.")
+                else:
+                    with st.spinner("Generating 200-character listing title…"):
+                        client = Groq(api_key=LLAMA_API_KEY)
+                        title = generate_listing_title(
+                            client, positive_text,
+                            str(row.get("property_type", "")),
+                            str(row.get("city", "")),
+                        )
+                    st.success("Generated listing title (≤200 chars)")
+                    st.info(title)
+                    st.caption(f"Length: {len(title)} characters")
+
+        with tab_neg:
+            st.subheader("Negative sentiment (for work orders & maintenance)")
+            st.write(negative_text)
+            st.divider()
+            st.subheader("Raise ticket")
+            with st.form("raise_ticket_form"):
+                category = st.selectbox(
+                    "Category",
+                    ["Maintenance", "Repair", "Cleaning", "Amenity issue", "Other"],
+                    key="ticket_category",
+                )
+                description = st.text_area("Description (optional)", key="ticket_desc", height=80)
+                submitted = st.form_submit_button("Submit ticket")
+            if submitted:
+                st.session_state[TICKETS].append({
+                    "listing_id": listing_id,
+                    "listing_name": listing_name,
+                    "category": category,
+                    "description": description or "(No description)",
+                })
+                st.success("Ticket raised. It will be used for work orders and owner scoring.")
+                st.balloons()
+
+        # Optional: show raised tickets for this session
+        session_tickets = [t for t in st.session_state[TICKETS] if t["listing_id"] == listing_id]
+        if session_tickets:
+            st.divider()
+            with st.expander("Tickets raised for this property (this session)"):
+                for t in session_tickets:
+                    st.write(f"**{t['category']}** — {t['description']}")
 
     st.divider()
-    st.caption("Data: Listings_1.csv · Model: " + LLAMA_MODEL)
+    st.caption("Data: " + LISTINGS_CSV + " · Model: " + LLAMA_MODEL)
 
 
 if __name__ == "__main__":
